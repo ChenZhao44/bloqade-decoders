@@ -16,6 +16,10 @@ if TYPE_CHECKING:
 class GurobiDecoder(BaseDecoder):
     """MLE decoder using Gurobi mixed-integer programming solver.
 
+    .. deprecated::
+        Use :class:`MILPDecoder` instead, which supports multiple solver
+        backends (HiGHS, CPLEX, COPT, Gurobi) through PuLP.
+
     Finds the most likely error pattern matching an observed syndrome
     by solving a mixed integer program via Gurobi.
 
@@ -47,6 +51,16 @@ class GurobiDecoder(BaseDecoder):
         objective: float
 
     def _instantiate(self, verbose: bool = False, **_kwargs: Any) -> None:
+        import warnings
+
+        warnings.warn(
+            "GurobiDecoder is deprecated; use MILPDecoder instead, which "
+            "supports multiple solver backends (HiGHS, CPLEX, COPT, Gurobi) "
+            "through PuLP.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
         try:
             import gurobipy  # noqa: F401
         except ImportError as e:
