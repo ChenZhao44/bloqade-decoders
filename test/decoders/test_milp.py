@@ -258,3 +258,102 @@ def test_decode_confidence_includes_prob_one_error_contributions(solver):
     np.testing.assert_array_equal(result, np.array([[True], [False]]))
     assert isinstance(confidence, np.ndarray)
     np.testing.assert_array_equal(confidence, np.ones(2))
+
+
+# --- SinterMILPDecoder tests ---
+
+import math
+
+import sinter
+
+from bloqade.decoders.sinter_interface import SinterMILPDecoder
+
+from .conftest import pack_dets, simple_dem, unpack_obs, repetition_circuit
+
+
+def test_sinter_milp_is_sinter_decoder():
+    decoder = SinterMILPDecoder()
+    assert isinstance(decoder, sinter.Decoder)
+
+
+@pytest.mark.parametrize("solver", SOLVERS)
+def test_sinter_milp_compile_returns_compiled_decoder(solver):
+    dem = simple_dem()
+    decoder = SinterMILPDecoder(solver=solver)
+    compiled = decoder.compile_decoder_for_dem(dem=dem)
+    assert isinstance(compiled, sinter.CompiledDecoder)
+
+
+@pytest.mark.parametrize("solver", SOLVERS)
+def test_sinter_milp_decode_shape_and_dtype(solver):
+    dem = simple_dem()
+    decoder = SinterMILPDecoder(solver=solver)
+    compiled = decoder.compile_decoder_for_dem(dem=dem)
+
+    det_shots = np.array([[1, 0], [0, 1], [0, 0]], dtype=bool)
+    packed_dets = pack_dets(det_shots)
+
+    result = compiled.decode_shots_bit_packed(
+        bit_packed_detection_event_data=packed_dets
+    )
+
+    num_obs_bytes = math.ceil(dem.num_observables / 8)
+    assert result.dtype == np.uint8
+    assert result.shape == (3, num_obs_bytes)
+
+
+@pytest.mark.parametrize("solver", SOLVERS)
+def test_sinter_milp_decode_correctness(solver):
+    dem = simple_dem()
+    decoder = SinterMILPDecoder(solver=solver)
+    compiled = decoder.compile_decoder_for_dem(dem=dem)
+
+    det_shots = np.array([[1, 0], [0, 1], [0, 0]], dtype=bool)
+    packed_dets = pack_dets(det_shots)
+
+    result = compiled.decode_shots_bit_packed(
+        bit_packed_detection_event_data=packed_dets
+    )
+    obs_predictions = unpack_obs(result, dem.num_observables)
+
+    expected = np.array([[True], [True], [False]])
+    assert np.array_equal(obs_predictions, expected)
+
+
+@pytest.mark.parametrize("solver", SOLVERS)
+def test_sinter_milp_no_error_syndrome(solver):
+    dem = simple_dem()
+    decoder = SinterMILPDecoder(solver=solver)
+    compiled = decoder.compile_decoder_for_dem(dem=dem)
+
+    det_shots = np.zeros((1, 2), dtype=bool)
+    packed_dets = pack_dets(det_shots)
+
+    result = compiled.decode_shots_bit_packed(
+        bit_packed_detection_event_data=packed_dets
+    )
+    obs_predictions = unpack_obs(result, dem.num_observables)
+
+    assert np.array_equal(obs_predictions, np.array([[False]]))
+
+
+@pytest.mark.slow
+def test_sinter_collect_milp():
+    circuit = repetition_circuit()
+    tasks = [
+        sinter.Task(
+            circuit=circuit,
+            decoder="milp",
+            json_metadata={"d": 3},
+        ),
+    ]
+    stats = sinter.collect(
+        num_workers=1,
+        tasks=tasks,
+        custom_decoders={"milp": SinterMILPDecoder()},
+        max_shots=100,
+    )
+    assert len(stats) == 1
+    assert stats[0].shots == 100
+    assert stats[0].errors <= stats[0].shots
+    assert stats[0].errors < 50
