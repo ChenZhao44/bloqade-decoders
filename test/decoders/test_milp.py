@@ -11,7 +11,7 @@ from .test_mle import regular_dem, regular_samples
 # Solver backends MILPDecoder claims to support. Tests only run for solvers
 # actually available in the environment (e.g. CPLEX/COPT need a license).
 SUPPORTED_SOLVERS = [
-    "HIGHS",
+    "HiGHS",
     "CPLEX_PY",
     "CPLEX_CMD",
     "COPT",

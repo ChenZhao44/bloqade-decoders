@@ -1,0 +1,254 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, cast
+
+import stim
+import numpy as np
+import numpy.typing as npt
+from stim import DemInstruction
+
+from ..base import BaseDecoder
+
+if TYPE_CHECKING:
+    import pulp
+
+
+class MILPDecoder(BaseDecoder):
+    """MLE decoder using mixed-integer programming via PuLP.
+
+    Finds the most likely error pattern matching an observed syndrome
+    by solving a mixed integer program. Supports multiple solver
+    backends through PuLP, including HiGHS, CPLEX, COPT, and Gurobi.
+
+    Does NOT support decomposed error models with separator targets.
+    Use ``detector_error_model(decompose_errors=False)`` instead.
+
+    Args:
+        dem: The detector error model describing the error structure.
+        solver: Name of a PuLP solver (e.g. ``"HiGHS"``, ``"CPLEX_PY"``,
+            ``"COPT"``, ``"GUROBI"``) or a ``pulp.LpSolver`` instance.
+            Defaults to ``"HiGHS"``.
+        verbose: If True, print solver output.
+
+    Examples:
+        >>> from bloqade.decoders import MILPDecoder
+        >>> import stim
+        >>> dem = stim.DetectorErrorModel(
+        ...     '''
+        ...     error(0.02) D0 L0
+        ...     error(0.1) D1 L0
+        ...     '''
+        ... )
+        >>> milp_decoder = MILPDecoder(dem)
+        >>> milp_decoder_cbc = MILPDecoder(dem, solver="PULP_CBC_CMD")
+    """
+
+    def _instantiate(
+        self, solver: str | pulp.LpSolver = "HiGHS", verbose: bool = False, **_kwargs: Any
+    ) -> None:
+        try:
+            import pulp
+        except ImportError as e:
+            raise ImportError(
+                "The pulp package is required for MILPDecoder. "
+                'You can install it via: pip install "pulp"'
+            ) from e
+
+        self._verbose = verbose
+        if isinstance(solver, str):
+            self._solver = pulp.getSolver(solver, msg=verbose)
+        else:
+            self._solver = solver
+        self._flat_dem = self.dem.flattened()
+        self._check_no_separators(self.dem)
+
+        # Single pass over DEM to extract weights, hyperedges, and observables
+        weights: list[float] = []
+        hyperedge_dets: list[list[int]] = []
+        hyperedge_obs: list[list[int]] = []
+
+        # Track errors with probability 1.0 (always fire)
+        certain_det_flip = np.zeros(self.num_detectors, dtype=int)
+        certain_obs_flip = np.zeros(self.num_observables, dtype=int)
+
+        for instruction in self._flat_dem:  # type: ignore[union-attr]
+            if not isinstance(instruction, DemInstruction):
+                raise TypeError(
+                    "The detector-error model should be already flattened. But still got DemRepeatBlock."
+                )
+            if instruction.type != "error":
+                continue
+            probability = instruction.args_copy()[0]
+            if probability == 0:
+                continue
+
+            det_targets: list[int] = []
+            obs_targets: list[int] = []
+            for t in instruction.targets_copy():
+                target = cast(stim.DemTarget, t)
+                if stim.DemTarget.is_relative_detector_id(target):
+                    det_targets.append(target.val)
+                else:
+                    obs_targets.append(target.val)
+
+            if probability == 1:
+                # Certain errors always fire: pre-apply their contributions
+                for d in det_targets:
+                    certain_det_flip[d] ^= 1
+                for o in obs_targets:
+                    certain_obs_flip[o] ^= 1
+            else:
+                weights.append(np.log(probability / (1 - probability)))
+                hyperedge_dets.append(det_targets)
+                hyperedge_obs.append(obs_targets)
+
+        # Invert hyperedge incidence: detector -> error indices touching it
+        detector_vertices: list[list[int]] = [
+            [] for _ in range(self.num_detectors)
+        ]
+        for e_idx, det_targets in enumerate(hyperedge_dets):
+            for d in det_targets:
+                detector_vertices[d].append(e_idx)
+
+        # Build observable indices (sized from DEM, not max seen index)
+        observable_indices: list[list[int]] = [[] for _ in range(self.num_observables)]
+        for e_idx, obs_targets in enumerate(hyperedge_obs):
+            for obs_val in obs_targets:
+                observable_indices[obs_val].append(e_idx)
+
+        self._detector_vertices = detector_vertices
+        self._weights = weights
+        self._observable_indices = observable_indices
+        self._certain_det_flip = certain_det_flip
+        self._certain_obs_flip = certain_obs_flip
+
+    @staticmethod
+    def _check_no_separators(dem: stim.DetectorErrorModel) -> None:
+        """Raise ValueError if the DEM contains separator targets."""
+        for instruction in dem:  # type: ignore[union-attr]
+            if not isinstance(instruction, DemInstruction):
+                continue
+            if instruction.type == "error":
+                for t in instruction.targets_copy():
+                    target = cast(stim.DemTarget, t)
+                    if stim.DemTarget.is_separator(target):
+                        raise ValueError(
+                            "MILPDecoder does not support decomposed "
+                            "error models with separator targets. Use "
+                            "detector_error_model(decompose_errors=False)"
+                            " instead."
+                        )
+
+    def weight_from_error(self, error: np.ndarray) -> np.ndarray:
+        """Return the log-odds objective value for each error configuration."""
+        return np.sum(error * self._weights, axis=1)
+
+    def _decode_error(
+        self, det_shots: np.ndarray, confidence: np.ndarray | None = None
+    ) -> np.ndarray:
+        import copy
+
+        import pulp
+
+        num_shots = det_shots.shape[0]
+        num_errors = len(self._weights)
+        errors = np.zeros([num_shots, num_errors], dtype=bool)
+
+        weights = self._weights
+        detector_vertices = self._detector_vertices
+        # Pre-apply certain errors (prob=1.0) to the syndrome
+        det_shots = det_shots.astype(int) ^ self._certain_det_flip
+
+        for d, detector_shot in enumerate(det_shots):
+            prob = pulp.LpProblem("mip", pulp.LpMaximize)
+            error_variables = [
+                pulp.LpVariable("e" + str(i), cat=pulp.LpBinary)
+                for i in range(num_errors)
+            ]
+            prob += pulp.lpSum(
+                w * error_variables[i] for i, w in enumerate(weights)
+            )
+
+            for i, dv in enumerate(detector_vertices):
+                detector_variable = pulp.LpVariable(
+                    "h" + str(i),
+                    lowBound=0,
+                    upBound=len(dv),
+                    cat=pulp.LpInteger,
+                )
+                prob += (
+                    pulp.lpSum(error_variables[j] for j in dv)
+                    - 2 * detector_variable
+                    == int(detector_shot[i]),
+                    "c" + str(i),
+                )
+
+            # PuLP solver objects cache solve state (e.g. the GUROBI API
+            # backend), so each problem must get a fresh solver instance.
+            prob.solve(copy.deepcopy(self._solver))
+            if pulp.LpStatus[prob.status] != "Optimal":
+                if self._verbose:
+                    print("Did not find optimal solution", pulp.LpStatus[prob.status])
+                if confidence is not None:
+                    confidence[d] = 0.0
+                continue
+            errors[d, :] = np.round(
+                np.array([pulp.value(e) for e in error_variables]), decimals=0
+            ).astype(bool)
+        return errors
+
+    def logical_from_error(self, errors: np.ndarray) -> np.ndarray:
+        """Convert batched error configurations into logical-observable flips.
+
+        Each row of ``errors`` selects the variable error mechanisms in the
+        flattened detector error model. Columns follow the order of error
+        instructions with probabilities strictly between zero and one; errors
+        with probability one are applied automatically. The logical targets of
+        the selected mechanisms are combined modulo two.
+
+        Args:
+            errors: Boolean array with shape
+                ``(num_shots, num_error_variables)``.
+
+        Returns:
+            Boolean array with shape ``(num_shots, num_observables)``.
+        """
+        num_shots = errors.shape[0]
+        observable_indices = self._observable_indices
+        # Start from certain error contributions (prob=1.0 errors always fire)
+        logicals = np.tile(self._certain_obs_flip, (num_shots, 1)).astype(float)
+        for i, error in enumerate(errors):
+            for o, observable_index in enumerate(observable_indices):
+                if len(observable_index) > 0:
+                    logicals[i, o] = (
+                        logicals[i, o] + np.sum(error[np.array(observable_index)])
+                    ) % 2
+        return logicals.astype(bool)
+
+    def _decode_batch(
+        self, detector_bits: npt.NDArray[np.bool_]
+    ) -> tuple[npt.NDArray[np.bool_], npt.NDArray[np.float64]]:
+        confidence = np.ones(len(detector_bits), dtype=np.float64)
+        errors = self._decode_error(detector_bits, confidence)
+        result = self.logical_from_error(errors)
+        result[confidence == 0.0] = False
+        return result, confidence
+
+    def _decode(self, detector_bits: npt.NDArray[np.bool_]) -> npt.NDArray[np.bool_]:
+        """Decode a single shot of detector bits."""
+        result, _ = self._decode_batch(detector_bits.reshape(1, -1))
+        return result[0]
+
+    def decode(self, detector_bits: npt.NDArray[np.bool_]) -> npt.NDArray[np.bool_]:
+        """Decode a batch or single shot of detector bits.
+
+        Args:
+            detector_bits: 1D (single shot) or 2D (batch) boolean array.
+
+        Returns:
+            Observable corrections as boolean array.
+        """
+        if detector_bits.ndim == 1:
+            return self._decode(detector_bits)
+        result, _ = self._decode_batch(detector_bits)
+        return result
