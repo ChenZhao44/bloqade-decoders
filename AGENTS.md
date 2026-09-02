@@ -33,20 +33,20 @@ Current decoder groups:
 - `tesseract.py`: wrapper around Tesseract configuration and compiled decoder.
 - `mle/decoder.py`: Gurobi MLE decoder (deprecated, emits
   `DeprecationWarning`; use `MILPDecoder` instead).
-- `milp/decoder.py`: PuLP-based MLE decoder supporting multiple solver
+- `mle/milp_decoder.py`: PuLP-based MLE decoder supporting multiple solver
   backends (HiGHS, CPLEX, COPT, Gurobi) via a `solver=` constructor argument.
 - `mld/decoder.py`: lookup-table decoder. Its `train(num_shots=...)` samples
   from `self.dem`; `instantiate(...)` is useful for tests or advanced callers
   that want to populate counts manually through `update_det_obs_counts(...)`.
 
 Both MLE decoders inherit from `BaseMLEDecoder` in
-`src/bloqade/decoders/_mle_base.py`, which owns the solver-independent parts:
-DEM parsing, logical-observable post-processing, and the logical-gap
-confidence computation. Subclasses implement `_setup_solver(...)`,
-`_decode_error(...)`, and `_solve_single_shot_for_confidence(...)`.
-`BaseMLEDecoder` deliberately lives outside `_decoders/` so the subclass
-discovery below does not pick it up as a concrete decoder.
+`src/bloqade/decoders/_decoders/mle/base.py`, which owns the
+solver-independent parts: DEM parsing, logical-observable post-processing,
+and the logical-gap confidence computation. Subclasses implement
+`_setup_solver(...)`, `_decode_error(...)`, and
+`_solve_single_shot_for_confidence(...)`.
 
 Tests in `test/decoders/test_decoders.py` derive the decoder list from
-`BaseDecoder.__subclasses__()`. Add new decoder classes to the package exports
-so they are imported before that discovery runs.
+`BaseDecoder.__subclasses__()`, skipping abstract classes (such as
+`BaseMLEDecoder`). Add new decoder classes to the package exports so they are
+imported before that discovery runs.

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 
-from ..._mle_base import BaseMLEDecoder
+from .base import BaseMLEDecoder
 
 if TYPE_CHECKING:
     from gurobipy import Env as GurobiEnv

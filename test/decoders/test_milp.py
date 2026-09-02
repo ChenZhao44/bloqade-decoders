@@ -1,11 +1,16 @@
 """Tests for the PuLP-based multi-solver MILP decoder."""
 
+import math
+
 import stim
 import numpy as np
 import pytest
+import sinter
 
-from bloqade.decoders import MILPDecoder
+from bloqade.decoders import MILPDecoder, GurobiDecoder
+from bloqade.decoders.sinter_interface import SinterMILPDecoder
 
+from .conftest import pack_dets, simple_dem, unpack_obs, repetition_circuit
 from .test_mle import regular_dem, regular_samples
 
 # Solver backends MILPDecoder claims to support. Tests only run for solvers
@@ -262,14 +267,6 @@ def test_decode_confidence_includes_prob_one_error_contributions(solver):
 
 # --- SinterMILPDecoder tests ---
 
-import math
-
-import sinter
-
-from bloqade.decoders.sinter_interface import SinterMILPDecoder
-
-from .conftest import pack_dets, simple_dem, unpack_obs, repetition_circuit
-
 
 def test_sinter_milp_is_sinter_decoder():
     decoder = SinterMILPDecoder()
@@ -360,8 +357,6 @@ def test_sinter_collect_milp():
 
 
 # --- Cross-solver consistency with GurobiDecoder ---
-
-from bloqade.decoders import GurobiDecoder
 
 
 def consistency_dems() -> dict[str, stim.DetectorErrorModel]:

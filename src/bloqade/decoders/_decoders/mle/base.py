@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from abc import abstractmethod
 from typing import Any, NamedTuple, cast
 
 import stim
@@ -7,7 +8,7 @@ import numpy as np
 import numpy.typing as npt
 from stim import DemInstruction
 
-from ._decoders.base import BaseDecoder
+from ..base import BaseDecoder
 
 
 class BaseMLEDecoder(BaseDecoder):
@@ -26,9 +27,8 @@ class BaseMLEDecoder(BaseDecoder):
     Does NOT support decomposed error models with separator targets.
     Use ``detector_error_model(decompose_errors=False)`` instead.
 
-    This class is intentionally not exported as a usable decoder: it is
-    excluded from the decoder discovery in ``test_decoders.py`` because
-    its module does not live under ``bloqade.decoders._decoders``.
+    This class is abstract: ``test_decoders.py`` discovers concrete
+    decoders via ``__subclasses__()`` and skips abstract ones.
     """
 
     class _ConfidenceSolveResult(NamedTuple):
@@ -123,11 +123,11 @@ class BaseMLEDecoder(BaseDecoder):
         """Return the log-odds objective value for each error configuration."""
         return np.sum(error * self._weights, axis=1)
 
+    @abstractmethod
     def _decode_error(
         self, det_shots: np.ndarray, confidence: np.ndarray | None = None
     ) -> np.ndarray:
         """Solve the MILP for a batch of detector shots. Solver-specific."""
-        raise NotImplementedError
 
     def logical_from_error(self, errors: np.ndarray) -> np.ndarray:
         """Convert batched error configurations into logical-observable flips.
@@ -185,6 +185,7 @@ class BaseMLEDecoder(BaseDecoder):
         result, _ = self._decode_batch(detector_bits)
         return result
 
+    @abstractmethod
     def _solve_single_shot_for_confidence(
         self,
         detector_shot: np.ndarray,
@@ -193,7 +194,6 @@ class BaseMLEDecoder(BaseDecoder):
         forbidden_logical: np.ndarray | None = None,
     ) -> tuple[_ConfidenceSolveResult | None, bool]:
         """Solve one shot, optionally excluding a logical class. Solver-specific."""
-        raise NotImplementedError
 
     def _decode_with_logical_gap(
         self,
