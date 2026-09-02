@@ -357,3 +357,70 @@ def test_sinter_collect_milp():
     assert stats[0].shots == 100
     assert stats[0].errors <= stats[0].shots
     assert stats[0].errors < 50
+
+
+# --- Cross-solver consistency with GurobiDecoder ---
+
+from bloqade.decoders import GurobiDecoder
+
+
+def consistency_dems() -> dict[str, stim.DetectorErrorModel]:
+    return {
+        "regular": regular_dem(),
+        "hyper": stim.DetectorErrorModel("""
+            error(0.1) D9 D0 D1 L0
+            error(0.1) D0 D1
+            error(0.1) D1 D2
+            error(0.1) D2 D3
+            error(0.1) D3 D4
+            error(0.1) D4 D5
+            error(0.1) D5 D6
+            error(0.1) D6 D7
+            error(0.1) D7 D8
+            error(0.1) D8 D9
+            """),
+        "multi_observable": stim.DetectorErrorModel("""
+            error(0.1) D0 L0
+            error(0.05) D0 D1
+            error(0.2) D1 L1
+            error(0.1) D1 L0 L1
+            """),
+        "prob_one": stim.DetectorErrorModel("""
+            error(0.1) D0 D1 L0
+            error(1.0) D1 D2 L0
+            error(0.05) D0 D2
+            """),
+    }
+
+
+def sample_syndromes(dem: stim.DetectorErrorModel, num_shots: int = 20) -> np.ndarray:
+    sampler = dem.compile_sampler()
+    det, _, _ = sampler.sample(num_shots, bit_packed=False)
+    return det
+
+
+@pytest.mark.parametrize("solver", SOLVERS)
+@pytest.mark.parametrize("dem_name", list(consistency_dems()))
+def test_decode_consistent_with_gurobi(solver, dem_name):
+    dem = consistency_dems()[dem_name]
+    det_shots = sample_syndromes(dem)
+
+    expected = GurobiDecoder(dem).decode(det_shots)
+    result = MILPDecoder(dem, solver=solver).decode(det_shots)
+
+    np.testing.assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize("solver", SOLVERS)
+@pytest.mark.parametrize("dem_name", list(consistency_dems()))
+def test_decode_confidence_consistent_with_gurobi(solver, dem_name):
+    dem = consistency_dems()[dem_name]
+    det_shots = sample_syndromes(dem)
+
+    expected_obs, expected_conf = GurobiDecoder(dem).decode_confidence(det_shots)
+    result_obs, result_conf = MILPDecoder(dem, solver=solver).decode_confidence(
+        det_shots
+    )
+
+    np.testing.assert_array_equal(result_obs, expected_obs)
+    np.testing.assert_allclose(result_conf, expected_conf, rtol=1e-6, atol=1e-9)
