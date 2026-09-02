@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import stim
 import numpy as np
@@ -42,6 +42,11 @@ class MILPDecoder(BaseDecoder):
         >>> milp_decoder = MILPDecoder(dem)
         >>> milp_decoder_cbc = MILPDecoder(dem, solver="PULP_CBC_CMD")
     """
+
+    class _ConfidenceSolveResult(NamedTuple):
+        error: np.ndarray
+        logical: np.ndarray
+        objective: float
 
     def _instantiate(
         self, solver: str | pulp.LpSolver = "HiGHS", verbose: bool = False, **_kwargs: Any
@@ -252,3 +257,201 @@ class MILPDecoder(BaseDecoder):
             return self._decode(detector_bits)
         result, _ = self._decode_batch(detector_bits)
         return result
+
+    def _solve_single_shot_for_confidence(
+        self,
+        detector_shot: np.ndarray,
+        *,
+        verbose: bool = False,
+        forbidden_logical: np.ndarray | None = None,
+    ) -> tuple[_ConfidenceSolveResult | None, bool]:
+        import copy
+
+        import pulp
+
+        prob = pulp.LpProblem("mip", pulp.LpMaximize)
+        weights = self._weights
+        detector_vertices = self._detector_vertices
+        observable_indices = self._observable_indices
+
+        error_variables = [
+            pulp.LpVariable("e" + str(i), cat=pulp.LpBinary)
+            for i in range(len(weights))
+        ]
+        prob += pulp.lpSum(w * error_variables[i] for i, w in enumerate(weights))
+
+        detector_shot = np.asarray(detector_shot, dtype=int) ^ self._certain_det_flip
+        for i, detector_vertex in enumerate(detector_vertices):
+            detector_variable = pulp.LpVariable(
+                "h" + str(i),
+                lowBound=0,
+                upBound=len(detector_vertex),
+                cat=pulp.LpInteger,
+            )
+            prob += (
+                pulp.lpSum(error_variables[j] for j in detector_vertex)
+                - 2 * detector_variable
+                == int(detector_shot[i]),
+                "c" + str(i),
+            )
+
+        logical_variables: list[pulp.LpVariable] = []
+        for obs_idx, observable_index in enumerate(observable_indices):
+            logical_var = pulp.LpVariable("l" + str(obs_idx), cat=pulp.LpBinary)
+            logical_variables.append(logical_var)
+            certain_flip = int(self._certain_obs_flip[obs_idx])
+            if len(observable_index) == 0:
+                prob += (
+                    logical_var == certain_flip,
+                    "lfix" + str(obs_idx),
+                )
+                continue
+            slack_var = pulp.LpVariable(
+                "u" + str(obs_idx),
+                lowBound=0,
+                upBound=len(observable_index),
+                cat=pulp.LpInteger,
+            )
+            prob += (
+                certain_flip
+                + pulp.lpSum(error_variables[j] for j in observable_index)
+                - 2 * slack_var
+                == logical_var,
+                "lpar" + str(obs_idx),
+            )
+
+        if forbidden_logical is not None:
+            diff_variables: list[pulp.LpVariable] = []
+            for obs_idx, forbidden_bit in enumerate(forbidden_logical.astype(int)):
+                diff_var = pulp.LpVariable("d" + str(obs_idx), cat=pulp.LpBinary)
+                diff_variables.append(diff_var)
+                if forbidden_bit:
+                    prob += (
+                        diff_var + logical_variables[obs_idx] == 1,
+                        "ddiff" + str(obs_idx),
+                    )
+                else:
+                    prob += (
+                        diff_var == logical_variables[obs_idx],
+                        "ddiff" + str(obs_idx),
+                    )
+            prob += (
+                pulp.lpSum(diff_variables) >= 1,
+                "logical_difference",
+            )
+
+        # PuLP solver objects cache solve state (e.g. the GUROBI API
+        # backend), so each problem must get a fresh solver instance.
+        solver = copy.deepcopy(self._solver)
+        if verbose and hasattr(solver, "msg"):
+            solver.msg = True
+        prob.solve(solver)
+        status = pulp.LpStatus[prob.status]
+        if status == "Infeasible" and forbidden_logical is not None:
+            return None, True
+        if status != "Optimal":
+            if verbose:
+                print("Did not find optimal solution", status)
+            return None, False
+
+        error = np.round(
+            np.array([pulp.value(var) for var in error_variables]), decimals=0
+        ).astype(bool)
+        logical = np.round(
+            np.array([pulp.value(var) for var in logical_variables]), decimals=0
+        ).astype(bool)
+        objective_value = float(pulp.value(prob.objective))
+        return (
+            self._ConfidenceSolveResult(
+                error=error,
+                logical=logical,
+                objective=objective_value,
+            ),
+            True,
+        )
+
+    def _decode_with_logical_gap(
+        self,
+        detector_bits: npt.NDArray[np.bool_],
+        verbose: bool = False,
+    ) -> tuple[npt.NDArray[np.bool_], np.ndarray]:
+        """Decode detector bits and return the logical-gap confidence score."""
+
+        single_shot = detector_bits.ndim == 1
+        det_shots = detector_bits.reshape(1, -1) if single_shot else detector_bits
+
+        decoded_obs = np.zeros(
+            (det_shots.shape[0], self.num_observables),
+            dtype=np.bool_,
+        )
+        logical_gaps = np.zeros(det_shots.shape[0], dtype=float)
+
+        for shot_idx, detector_shot in enumerate(det_shots.astype(int)):
+            best, best_converged = self._solve_single_shot_for_confidence(
+                detector_shot,
+                verbose=verbose,
+            )
+            if not best_converged:
+                continue
+            assert best is not None
+            decoded_obs[shot_idx] = best.logical
+            second, second_converged = self._solve_single_shot_for_confidence(
+                detector_shot,
+                verbose=verbose,
+                forbidden_logical=best.logical,
+            )
+            if not second_converged:
+                continue
+            logical_gaps[shot_idx] = (
+                np.inf if second is None else best.objective - second.objective
+            )
+
+        if single_shot:
+            return decoded_obs[0], logical_gaps
+        return decoded_obs, logical_gaps
+
+    def decode_confidence(
+        self, detector_bits: npt.NDArray[np.bool_]
+    ) -> tuple[npt.NDArray[np.bool_], float | npt.NDArray[np.float64]]:
+        """Decode detector bits and return normalized logical-gap confidence.
+
+        For a detector syndrome, let ``best`` be the most likely error
+        configuration and ``alternative`` be the most likely configuration
+        with a different logical correction. First compute the logical gap
+
+        ``log(P(best) / P(alternative))``,
+
+        as the difference between their solver objective values. The returned
+        confidence is ``tanh(logical_gap / 2)``, a normalized likelihood margin
+        in ``[0.0, 1.0]``. It is ``1.0`` when no alternative logical correction
+        is feasible and ``0.0`` when the alternatives are equally likely or
+        either optimization does not find an optimal solution. If the initial
+        solve is not optimal, the default correction is all zeros. If only the
+        alternative solve is not optimal, the best correction from the initial
+        solve is returned with ``0.0`` confidence.
+
+        A single detector shot returns one correction and a scalar confidence.
+        A batch returns corrections with shape ``(shots, num_observables)``
+        and confidence scores with shape ``(shots,)``.
+
+        Args:
+            detector_bits: 1D (single shot) or 2D (batch) boolean array.
+
+        Returns:
+            A tuple where the first element is the observable corrections, and the second element is the confidence score.
+            The confidence score is either a float (for 1D inputs) or an array of floats (for 2D inputs).
+        """
+
+        single_shot = detector_bits.ndim == 1
+        decoded_obs, logical_gaps = self._decode_with_logical_gap(
+            detector_bits, verbose=self._verbose
+        )
+
+        decoded_obs = decoded_obs.astype(np.bool_)
+        logical_gaps = np.asarray(logical_gaps, dtype=np.float64).reshape(-1)
+        confidence = np.tanh(np.maximum(logical_gaps, 0.0) / 2.0)
+
+        if single_shot:
+            return decoded_obs, float(confidence[0])
+
+        return decoded_obs, confidence
