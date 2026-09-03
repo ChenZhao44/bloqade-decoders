@@ -7,8 +7,8 @@ import numpy as np
 from sinter import Decoder as _SinterDecoder, CompiledDecoder as _SinterCompiledDecoder
 
 from .base import BaseMLEDecoder
-from .decoder import GurobiDecoder
 from .milp_decoder import MILPDecoder
+from .gurobi_decoder import GurobiDecoder
 
 if TYPE_CHECKING:
     import pulp

@@ -31,7 +31,7 @@ Current decoder groups:
   from `self.dem` during `_instantiate(...)`.
 - `mwpf.py`: wrapper around MWPF's sinter-compatible decoder.
 - `tesseract.py`: wrapper around Tesseract configuration and compiled decoder.
-- `mle/decoder.py`: Gurobi MLE decoder (deprecated, emits
+- `mle/gurobi_decoder.py`: Gurobi MLE decoder (deprecated, emits
   `DeprecationWarning`; use `MILPDecoder` instead).
 - `mle/milp_decoder.py`: PuLP-based MLE decoder supporting multiple solver
   backends (HiGHS, CPLEX, COPT, Gurobi) via a `solver=` constructor argument.
