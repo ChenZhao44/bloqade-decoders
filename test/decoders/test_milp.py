@@ -102,6 +102,53 @@ def test_unknown_solver_rejected():
         MILPDecoder(dem, solver="NO_SUCH_SOLVER")
 
 
+def test_non_copyable_solver_instance_rejected():
+    import threading
+
+    import pulp
+
+    class UnpicklableSolver(pulp.HiGHS):
+        def __init__(self):
+            super().__init__(msg=False)
+            self._lock = threading.Lock()  # cannot be pickled, like COPT handles
+
+    with pytest.raises(ValueError, match="deep-copied"):
+        MILPDecoder(regular_dem(), solver=UnpicklableSolver())
+
+
+def test_solver_factory_builds_a_fresh_solver_per_shot():
+    import pulp
+
+    dem = regular_dem()
+    det_shots, obs_shots = regular_samples()
+    created: list[pulp.LpSolver] = []
+
+    def factory() -> pulp.LpSolver:
+        solver = pulp.getSolver("HiGHS", msg=False)
+        created.append(solver)
+        return solver
+
+    decoder = MILPDecoder(dem, solver=factory)
+    result = decoder.decode(det_shots)
+
+    assert (obs_shots == result).all()
+    assert len(created) == len(det_shots)
+    assert len({id(solver) for solver in created}) == len(created)
+
+
+def test_decode_raises_on_non_optimal_status():
+    import pulp
+
+    dem = stim.DetectorErrorModel("""
+        detector D0
+        error(0) L0
+        """)
+    decoder = MILPDecoder(dem)
+
+    with pytest.raises(pulp.PulpSolverError, match="no optimal solution"):
+        decoder.decode(np.array([True], dtype=bool))
+
+
 def test_separator_targets_rejected():
     dem = stim.DetectorErrorModel("""
         error(0.1) D0 ^ D1 L0

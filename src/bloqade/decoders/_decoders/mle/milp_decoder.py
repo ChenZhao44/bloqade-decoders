@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -25,12 +26,25 @@ class MILPDecoder(BaseMLEDecoder):
     Does NOT support decomposed error models with separator targets.
     Use ``detector_error_model(decompose_errors=False)`` instead.
 
+    Decoding raises ``pulp.PulpSolverError`` when a shot does not solve to
+    optimality (timeout, infeasible, numerical trouble, ...). No fallback
+    correction is returned in that case; catch the error to retry or skip.
+
     Args:
         dem: The detector error model describing the error structure.
         solver: Name of a PuLP solver (e.g. ``"HiGHS"``, ``"CPLEX_PY"``,
-            ``"COPT"``, ``"GUROBI"``) or a ``pulp.LpSolver`` instance.
-            Defaults to ``"HiGHS"``.
+            ``"COPT"``, ``"GUROBI"``), a ``pulp.LpSolver`` instance, or a
+            zero-argument factory returning one. Defaults to ``"HiGHS"``.
+            Instances must be deep-copyable: solvers holding native handles
+            (such as ``pulp.COPT``, whose coptpy environment cannot be
+            pickled) must be passed by name or as a factory instead.
         verbose: If True, print solver output.
+
+    Additional keyword arguments are forwarded to the PuLP solver
+    constructor when ``solver`` is a name. PuLP's COPT backend applies
+    ``gapRel`` only when truthy, so ``gapRel=0`` is silently ignored; pass
+    the native parameters instead, e.g.
+    ``MILPDecoder(dem, solver="COPT", RelGap=0.0, AbsGap=0.0)``.
 
     Examples:
         >>> from bloqade.decoders import MILPDecoder
@@ -47,9 +61,9 @@ class MILPDecoder(BaseMLEDecoder):
 
     def _setup_solver(
         self,
-        solver: str | pulp.LpSolver = "HiGHS",
+        solver: str | pulp.LpSolver | Callable[[], pulp.LpSolver] = "HiGHS",
         verbose: bool = False,
-        **_kwargs: Any,
+        **solver_options: Any,
     ) -> None:
         try:
             import pulp
@@ -59,10 +73,44 @@ class MILPDecoder(BaseMLEDecoder):
                 'You can install it via: pip install "pulp"'
             ) from e
 
+        self._solver_name: str | None = None
+        self._solver_factory: Callable[[], pulp.LpSolver] | None = None
+
         if isinstance(solver, str):
-            self._solver = pulp.getSolver(solver, msg=verbose)
+            self._solver_name = solver
+            self._solver_options = solver_options
+            # Validate the name and options eagerly; solving would otherwise
+            # fail only on the first decode call.
+            self._close_solver(pulp.getSolver(solver, **solver_options))
+        elif isinstance(solver, pulp.LpSolver):
+            if solver_options:
+                raise ValueError(
+                    "solver options cannot be forwarded to an LpSolver "
+                    "instance; configure the instance itself"
+                )
+            # Each solve needs a fresh solver (PuLP solver objects cache
+            # solve state), provided for instances via deepcopy. Solvers
+            # holding native handles (e.g. pulp.COPT's coptpy environment)
+            # cannot be deep-copied, so fail fast here with alternatives.
+            try:
+                copy.deepcopy(solver)
+            except Exception as e:
+                raise ValueError(
+                    f"Solver instance of type {type(solver).__name__} cannot "
+                    "be deep-copied (native solver handles are not "
+                    'picklable). Pass the solver by name (e.g. solver="COPT") '
+                    "or as a zero-argument factory "
+                    "(e.g. solver=lambda: pulp.COPT(RelGap=0.0))."
+                ) from e
+            self._solver_factory = lambda: copy.deepcopy(solver)
+        elif callable(solver):
+            self._solver_factory = solver
         else:
-            self._solver = solver
+            raise TypeError(
+                "solver must be a PuLP solver name, a pulp.LpSolver "
+                "instance, or a zero-argument callable returning a "
+                "pulp.LpSolver"
+            )
 
     def _instantiate(self, verbose: bool = False, **kwargs: Any) -> None:
         super()._instantiate(verbose=verbose, **kwargs)
@@ -90,8 +138,7 @@ class MILPDecoder(BaseMLEDecoder):
                 cat=pulp.LpInteger,
             )
             self._prob += (
-                pulp.lpSum(self._error_variables[j] for j in dv)
-                - 2 * detector_variable
+                pulp.lpSum(self._error_variables[j] for j in dv) - 2 * detector_variable
                 == 0,
                 "c" + str(i),
             )
@@ -131,12 +178,33 @@ class MILPDecoder(BaseMLEDecoder):
 
     def _fresh_solver(self, verbose: bool | None = None) -> pulp.LpSolver:
         # PuLP solver objects cache solve state (e.g. the GUROBI API
-        # backend), so each solve must get a fresh solver instance.
-        solver = copy.deepcopy(self._solver)
+        # backend), and native-API backends like COPT cannot be deep-copied
+        # at all, so each solve builds a new solver rather than cloning a
+        # template instance.
+        import pulp
+
         show = self._verbose if verbose is None else verbose
+        if self._solver_name is not None:
+            return pulp.getSolver(self._solver_name, msg=show, **self._solver_options)
+        solver = cast(Callable[[], pulp.LpSolver], self._solver_factory)()
         if show and hasattr(solver, "msg"):
             solver.msg = True
         return solver
+
+    @staticmethod
+    def _close_solver(solver: pulp.LpSolver) -> None:
+        # Native-API backends hold external resources: pulp.COPT keeps a
+        # coptpy environment open unless it is closed explicitly.
+        env = getattr(solver, "coptenv", None)
+        if env is not None:
+            env.close()
+
+    def _solve_prob(self, verbose: bool | None = None) -> None:
+        solver = self._fresh_solver(verbose)
+        try:
+            self._prob.solve(solver)
+        finally:
+            self._close_solver(solver)
 
     def _decode_error(
         self, det_shots: np.ndarray, confidence: np.ndarray | None = None
@@ -149,16 +217,14 @@ class MILPDecoder(BaseMLEDecoder):
 
         for d, detector_shot in enumerate(det_shots):
             self._set_syndrome(detector_shot)
-            self._prob.solve(self._fresh_solver())
-            if pulp.LpStatus[self._prob.status] != "Optimal":
-                if self._verbose:
-                    print(
-                        "Did not find optimal solution",
-                        pulp.LpStatus[self._prob.status],
-                    )
-                if confidence is not None:
-                    confidence[d] = 0.0
-                continue
+            self._solve_prob()
+            status = pulp.LpStatus[self._prob.status]
+            if status != "Optimal":
+                raise pulp.PulpSolverError(
+                    f"MILPDecoder found no optimal solution for shot {d}: "
+                    f"solver status is {status!r}. No fallback correction "
+                    "is returned; catch this error to retry or skip the shot."
+                )
             errors[d, :] = np.round(
                 np.array([pulp.value(e) for e in self._error_variables]), decimals=0
             ).astype(bool)
@@ -200,7 +266,7 @@ class MILPDecoder(BaseMLEDecoder):
             added_constraints.append("logical_difference")
 
         try:
-            self._prob.solve(self._fresh_solver(verbose))
+            self._solve_prob(verbose)
             status = pulp.LpStatus[self._prob.status]
             if status == "Infeasible" and forbidden_logical is not None:
                 return None, True
