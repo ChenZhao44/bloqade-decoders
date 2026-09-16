@@ -157,6 +157,42 @@ def test_separator_targets_rejected():
         MILPDecoder(dem)
 
 
+def test_separator_targets_rejected_inside_repeat_block():
+    dem = stim.DetectorErrorModel("""
+        repeat 2 {
+            error(0.1) D0 ^ D1 L0
+        }
+        """)
+    with pytest.raises(ValueError, match="separator"):
+        MILPDecoder(dem)
+
+
+def test_short_syndrome_rejected():
+    decoder = MILPDecoder(regular_dem())
+    with pytest.raises(ValueError, match="detector"):
+        decoder.decode(np.array([True], dtype=bool))
+
+
+def test_msg_option_accepted_for_named_solver():
+    dem = regular_dem()
+    det_shots, obs_shots = regular_samples()
+    decoder = MILPDecoder(dem, solver="HiGHS", msg=False)
+    result = decoder.decode(det_shots)
+    assert (obs_shots == result).all()
+
+
+def test_decode_confidence_does_not_accumulate_diff_variables():
+    dem = regular_dem()
+    det_shots, _ = regular_samples()
+    decoder = MILPDecoder(dem)
+
+    decoder.decode_confidence(det_shots)
+    num_variables = len(decoder._prob._variables)
+    decoder.decode_confidence(det_shots)
+
+    assert len(decoder._prob._variables) == num_variables
+
+
 def test_milp_decoder_can_instantiate_without_training():
     dem = regular_dem()
     det_shots, obs_shots = regular_samples()

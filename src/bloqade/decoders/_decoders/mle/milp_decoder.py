@@ -77,6 +77,11 @@ class MILPDecoder(BaseMLEDecoder):
         self._solver_factory: Callable[[], pulp.LpSolver] | None = None
 
         if isinstance(solver, str):
+            # msg and verbose control the same switch; forwarding both to
+            # getSolver would be a duplicate keyword argument.
+            msg = solver_options.pop("msg", None)
+            if msg is not None:
+                self._verbose = bool(msg)
             self._solver_name = solver
             self._solver_options = solver_options
             # Validate the name and options eagerly; solving would otherwise
@@ -169,9 +174,23 @@ class MILPDecoder(BaseMLEDecoder):
                 "lpar" + str(obs_idx),
             )
 
+        # Persistent diff variables for the forbidden-logical constraints in
+        # _solve_single_shot_for_confidence. Creating fresh ones per solve
+        # would accumulate unconstrained variables in the persistent model.
+        self._diff_variables = [
+            pulp.LpVariable("d" + str(obs_idx), cat=pulp.LpBinary)
+            for obs_idx in range(self.num_observables)
+        ]
+
     def _set_syndrome(self, detector_shot: np.ndarray) -> None:
         """Replace the detector-constraint RHS with a new shot's syndrome."""
-        shot = np.asarray(detector_shot, dtype=int) ^ self._certain_det_flip
+        shot = np.asarray(detector_shot, dtype=int)
+        if shot.shape[0] != self.num_detectors:
+            raise ValueError(
+                f"Expected a syndrome with {self.num_detectors} detector "
+                f"bits, got {shot.shape[0]}."
+            )
+        shot = shot ^ self._certain_det_flip
         # PuLP stores `expr == rhs` as `expr - rhs`, so constant = -rhs.
         for constraint, bit in zip(self._detector_constraints, shot):
             constraint.constant = -int(bit)
@@ -243,10 +262,9 @@ class MILPDecoder(BaseMLEDecoder):
 
         added_constraints: list[str] = []
         if forbidden_logical is not None:
-            diff_variables: list[pulp.LpVariable] = []
+            diff_variables = self._diff_variables
             for obs_idx, forbidden_bit in enumerate(forbidden_logical.astype(int)):
-                diff_var = pulp.LpVariable("d" + str(obs_idx), cat=pulp.LpBinary)
-                diff_variables.append(diff_var)
+                diff_var = diff_variables[obs_idx]
                 name = "ddiff" + str(obs_idx)
                 if forbidden_bit:
                     self._prob += (

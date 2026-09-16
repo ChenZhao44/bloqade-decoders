@@ -43,7 +43,9 @@ class BaseMLEDecoder(BaseDecoder):
         self._verbose = verbose
         self._setup_solver(verbose=verbose, **kwargs)
         self._flat_dem = self.dem.flattened()
-        self._check_no_separators(self.dem)
+        # Check the flattened DEM: repeat blocks in the original would hide
+        # separator targets from the scan.
+        self._check_no_separators(self._flat_dem)
 
         # Single pass over DEM to extract weights, hyperedges, and observables
         weights: list[float] = []
