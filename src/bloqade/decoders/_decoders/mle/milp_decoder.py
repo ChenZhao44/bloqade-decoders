@@ -312,4 +312,14 @@ class MILPDecoder(BaseMLEDecoder):
             )
         finally:
             for name in added_constraints:
-                self._prob.constraints.pop(name, None)
+                constraint = self._prob.constraints.pop(name, None)
+                if constraint is None:
+                    continue
+                # PuLP's addConstraint also appends to modifiedConstraints;
+                # drop that entry too or the temporary constraint is
+                # retained for the lifetime of the persistent model.
+                # Compare by identity: LpConstraint.__eq__ is expression
+                # equality and could match unrelated constraints.
+                self._prob.modifiedConstraints = [
+                    c for c in self._prob.modifiedConstraints if c is not constraint
+                ]

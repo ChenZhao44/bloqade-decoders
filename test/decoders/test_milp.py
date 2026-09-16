@@ -188,9 +188,11 @@ def test_decode_confidence_does_not_accumulate_diff_variables():
 
     decoder.decode_confidence(det_shots)
     num_variables = len(decoder._prob._variables)
+    num_modified_constraints = len(decoder._prob.modifiedConstraints)
     decoder.decode_confidence(det_shots)
 
     assert len(decoder._prob._variables) == num_variables
+    assert len(decoder._prob.modifiedConstraints) == num_modified_constraints
 
 
 def test_milp_decoder_can_instantiate_without_training():
